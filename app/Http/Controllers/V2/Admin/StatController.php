@@ -439,69 +439,104 @@ class StatController extends Controller
         $startDate = $request->input('start_time', strtotime('-7 days'));
         $endDate = $request->input('end_time', time());
         $previousStartDate = $startDate - ($endDate - $startDate);
-        $previousEndDate = $startDate;
 
         if ($type === 'node') {
-            // Get node traffic data
-            $currentData = StatServer::selectRaw('server_id as id, SUM(u + d) as value')
-                ->where('record_at', '>=', $startDate)
-                ->where('record_at', '<=', $endDate)
-                ->groupBy('server_id')
-                ->orderBy('value', 'DESC')
-                ->limit(10)
-                ->get();
-
-            // Get previous period data for comparison
-            $previousData = StatServer::selectRaw('server_id as id, SUM(u + d) as value')
-                ->where('record_at', '>=', $previousStartDate)
-                ->where('record_at', '<', $previousEndDate)
-                ->whereIn('server_id', $currentData->pluck('id'))
-                ->groupBy('server_id')
-                ->get()
-                ->keyBy('id');
-
+            $result = $this->getNodeTrafficRank($startDate, $endDate, $previousStartDate);
         } else {
-            // Get user traffic data
-            $currentData = StatUser::selectRaw('user_id as id, SUM(u + d) as value')
-                ->where('record_at', '>=', $startDate)
-                ->where('record_at', '<=', $endDate)
-                ->groupBy('user_id')
-                ->orderBy('value', 'DESC')
-                ->limit(10)
-                ->get();
-
-            // Get previous period data for comparison
-            $previousData = StatUser::selectRaw('user_id as id, SUM(u + d) as value')
-                ->where('record_at', '>=', $previousStartDate)
-                ->where('record_at', '<', $previousEndDate)
-                ->whereIn('user_id', $currentData->pluck('id'))
-                ->groupBy('user_id')
-                ->get()
-                ->keyBy('id');
-        }
-
-        $result = [];
-        foreach ($currentData as $data) {
-            $previousValue = isset($previousData[$data->id]) ? $previousData[$data->id]->value : 0;
-            $change = $previousValue > 0 ? round(($data->value - $previousValue) / $previousValue * 100, 1) : 0;
-
-            $name = $type === 'node'
-                ? optional(Server::find($data->id))->name ?? "Node {$data->id}"
-                : optional(User::find($data->id))->email ?? "User {$data->id}";
-
-            $result[] = [
-                'id' => (string) $data->id,
-                'name' => $name,
-                'value' => $data->value, // Convert to GB
-                'previousValue' => $previousValue, // Convert to GB
-                'change' => $change,
-                'timestamp' => date('c', $endDate)
-            ];
+            $result = $this->getUserTrafficRank($startDate, $endDate, $previousStartDate);
         }
 
         return [
             'timestamp' => date('c'),
             'data' => $result
         ];
+    }
+
+    /**
+     * Get node traffic ranking with optimized query
+     */
+    private function getNodeTrafficRank(int $startDate, int $endDate, int $previousStartDate): array
+    {
+        // Single query with conditional aggregation for both periods
+        $data = StatServer::selectRaw('
+                server_id as id,
+                SUM(CASE WHEN record_at >= ? AND record_at <= ? THEN u + d ELSE 0 END) as value,
+                SUM(CASE WHEN record_at >= ? AND record_at < ? THEN u + d ELSE 0 END) as previous_value
+            ', [$startDate, $endDate, $previousStartDate, $startDate])
+            ->where('record_at', '>=', $previousStartDate)
+            ->where('record_at', '<=', $endDate)
+            ->groupBy('server_id')
+            ->havingRaw('SUM(CASE WHEN record_at >= ? AND record_at <= ? THEN u + d ELSE 0 END) > 0', [$startDate, $endDate])
+            ->orderByRaw('SUM(CASE WHEN record_at >= ? AND record_at <= ? THEN u + d ELSE 0 END) DESC', [$startDate, $endDate])
+            ->limit(10)
+            ->get();
+
+        if ($data->isEmpty()) {
+            return [];
+        }
+
+        // Batch load server names to avoid N+1
+        $serverIds = $data->pluck('id')->toArray();
+        $servers = Server::whereIn('id', $serverIds)
+            ->pluck('name', 'id')
+            ->toArray();
+
+        return $this->formatTrafficRankResult($data, $servers, 'Node', $endDate);
+    }
+
+    /**
+     * Get user traffic ranking with optimized query
+     */
+    private function getUserTrafficRank(int $startDate, int $endDate, int $previousStartDate): array
+    {
+        // Single query with conditional aggregation for both periods
+        $data = StatUser::selectRaw('
+                user_id as id,
+                SUM(CASE WHEN record_at >= ? AND record_at <= ? THEN u + d ELSE 0 END) as value,
+                SUM(CASE WHEN record_at >= ? AND record_at < ? THEN u + d ELSE 0 END) as previous_value
+            ', [$startDate, $endDate, $previousStartDate, $startDate])
+            ->where('record_at', '>=', $previousStartDate)
+            ->where('record_at', '<=', $endDate)
+            ->groupBy('user_id')
+            ->havingRaw('SUM(CASE WHEN record_at >= ? AND record_at <= ? THEN u + d ELSE 0 END) > 0', [$startDate, $endDate])
+            ->orderByRaw('SUM(CASE WHEN record_at >= ? AND record_at <= ? THEN u + d ELSE 0 END) DESC', [$startDate, $endDate])
+            ->limit(10)
+            ->get();
+
+        if ($data->isEmpty()) {
+            return [];
+        }
+
+        // Batch load user emails to avoid N+1
+        $userIds = $data->pluck('id')->toArray();
+        $users = User::whereIn('id', $userIds)
+            ->pluck('email', 'id')
+            ->toArray();
+
+        return $this->formatTrafficRankResult($data, $users, 'User', $endDate);
+    }
+
+    /**
+     * Format traffic rank result
+     */
+    private function formatTrafficRankResult($data, array $nameMap, string $fallbackPrefix, int $endDate): array
+    {
+        $result = [];
+        foreach ($data as $item) {
+            $previousValue = $item->previous_value ?? 0;
+            $change = $previousValue > 0 
+                ? round(($item->value - $previousValue) / $previousValue * 100, 1) 
+                : 0;
+
+            $result[] = [
+                'id' => (string) $item->id,
+                'name' => $nameMap[$item->id] ?? "{$fallbackPrefix} {$item->id}",
+                'value' => $item->value,
+                'previousValue' => $previousValue,
+                'change' => $change,
+                'timestamp' => date('c', $endDate)
+            ];
+        }
+        return $result;
     }
 }
